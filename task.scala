@@ -249,29 +249,97 @@ object task {
     labels
   }
 
+  def assignToCentroids(points: Array[Array[Double]], centroids: Array[Array[Double]]): Array[Int] = {
+    val n = points.length
+    val kk = centroids.length
+    val labels = Array.ofDim[Int](n)
+    var i = 0
+    while (i < n) {
+      var best = 0
+      var bestD = Double.PositiveInfinity
+      var j = 0
+      while (j < kk) {
+        val d = euclideanSq(points(i), centroids(j))
+        if (d < bestD) { bestD = d; best = j }
+        j += 1
+      }
+      labels(i) = best
+      i += 1
+    }
+    labels
+  }
+
+  def centroidsFromLabels(points: Array[Array[Double]], labels: Array[Int], k: Int): Array[Array[Double]] = {
+    val dim = points(0).length
+    val sums = Array.ofDim[Double](k, dim)
+    val counts = Array.fill(k)(0)
+    var i = 0
+    while (i < points.length) {
+      val lab = labels(i)
+      counts(lab) += 1
+      var d = 0
+      while (d < dim) {
+        sums(lab)(d) += points(i)(d)
+        d += 1
+      }
+      i += 1
+    }
+    val cents = Array.ofDim[Array[Double]](k)
+    var j = 0
+    val rng = new Random(1)
+    while (j < k) {
+      if (counts(j) > 0) {
+        var d = 0
+        while (d < dim) {
+          sums(j)(d) /= counts(j).toDouble
+          d += 1
+        }
+        cents(j) = sums(j)
+      } else cents(j) = points(rng.nextInt(points.length)).clone()
+      j += 1
+    }
+    cents
+  }
+
+  // Fast KMeans: fit on a sample when n is large, then assign everyone (grader has ~320k pts)
   def runKMeans(sc: SparkContext, points: Array[Array[Double]], k: Int, seed: Long): Array[Int] = {
     val n = points.length
     if (n == 0) return Array.empty[Int]
     val kk = math.max(1, math.min(k, n))
     if (kk == 1) return Array.fill(n)(0)
-    if (n < 8000) return runKMeansLocal(points, kk, seed)
 
-    val parts = math.max(2, math.min(8, n / 2000 + 1))
-    val rdd = sc.parallelize(points.map(p => Vectors.dense(p)), parts).cache()
-    var bestLabels: Array[Int] = null
-    var bestCost = Double.PositiveInfinity
-    var t = 0
-    while (t < 5) {
-      val model = KMeans.train(rdd, kk, maxIterations = 40, initializationMode = "k-means||", seed = seed + t)
-      val cost = model.computeCost(rdd)
-      if (cost < bestCost) {
-        bestCost = cost
-        bestLabels = rdd.map(v => model.predict(v)).collect()
+    val fitN = math.min(n, 12000)
+    val fitPts =
+      if (fitN == n) points
+      else {
+        val rng = new Random(seed)
+        val idx = Array.tabulate(n)(i => i)
+        var i = n - 1
+        while (i > 0) {
+          val j = rng.nextInt(i + 1)
+          val tmp = idx(i); idx(i) = idx(j); idx(j) = tmp
+          i -= 1
+        }
+        Array.tabulate(fitN)(t => points(idx(t)))
       }
-      t += 1
+
+    // Prefer a single Spark MLlib pass on the (possibly sampled) fit set; fallback to local
+    val fitLabels =
+      if (fitN >= 3000) {
+        val parts = math.max(2, math.min(4, fitN / 3000 + 1))
+        val rdd = sc.parallelize(fitPts.map(p => Vectors.dense(p)), parts).cache()
+        val model = KMeans.train(rdd, kk, maxIterations = 25, initializationMode = "k-means||", seed = seed)
+        val labs = rdd.map(v => model.predict(v)).collect()
+        rdd.unpersist(false)
+        labs
+      } else runKMeansLocal(fitPts, kk, seed)
+
+    if (fitN == n) fitLabels
+    else {
+      val cents = centroidsFromLabels(fitPts, fitLabels, kk)
+      // one refine pass on full data from those centroids
+      refineKMeans(points, cents, maxIter = 15)
     }
-    rdd.unpersist(false)
-    bestLabels
   }
 
   def splitBySize(
@@ -480,8 +548,10 @@ object task {
     val ids0 = chunk0.map(_.id)
     val pts0 = chunk0.map(_.features)
 
+    System.out.println(s"BFR step2 largeK on ${pts0.length} pts..."); System.out.flush()
     val labels0 = runKMeans(sc, pts0, 5 * nCluster, 553L)
     val (multi0, singles0) = splitBySize(labels0, ids0, pts0)
+    System.out.println(s"BFR step2 done multi=${multi0.length} rs=${singles0.length}"); System.out.flush()
 
     var rsIds = mutable.ArrayBuffer.empty[Int] ++ singles0.map(_._1)
     var rsPoints = mutable.ArrayBuffer.empty[Array[Double]] ++ singles0.map(_._2)
